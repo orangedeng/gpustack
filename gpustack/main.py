@@ -1,4 +1,5 @@
 import argparse
+from multiprocessing import freeze_support
 
 from gpustack.cmd import setup_start_cmd
 from gpustack.cmd.chat import setup_chat_cmd
@@ -36,4 +37,5 @@ def main():
 
 
 if __name__ == "__main__":
+    freeze_support()
     main()

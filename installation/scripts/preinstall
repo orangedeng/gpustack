@@ -1,0 +1,24 @@
+#!/bin/bash
+
+set -e
+
+PLIST_PATH="/Library/LaunchDaemons/ai.gpustack.plist"
+if [ -e "$PLIST_PATH" ]; then
+  if launchctl list | grep -q "ai.gpustack"; then
+    echo "Service is running, attempting to bootout..."
+    sudo launchctl bootout system "$PLIST_PATH"
+  else
+    echo "Service is not running"
+  fi
+fi
+
+OLD_DATA_PATH="/var/lib/gpustack"
+NEW_DATA_PATH="/Library/Application Support/GPUStack/data"
+if [ -d "$OLD_DATA_PATH" ] && [ ! -d "$NEW_DATA_PATH" ]; then
+  echo "Moving data from $OLD_DATA_PATH to $NEW_DATA_PATH..."
+  sudo mkdir -p "$(dirname "$NEW_DATA_PATH")"
+  sudo mv "$OLD_DATA_PATH" "$NEW_DATA_PATH"
+  echo "Data moved successfully."
+else
+  echo "No data to move or $NEW_DATA_PATH already exists."
+fi

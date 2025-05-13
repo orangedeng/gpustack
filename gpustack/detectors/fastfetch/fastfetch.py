@@ -260,9 +260,8 @@ class Fastfetch(GPUDetector, SystemInfoDetector):
         if platform.system().lower() == "windows":
             command += ".exe"
 
-        with pkg_resources.path(
-            "gpustack.third_party.bin.fastfetch", command
-        ) as executable_path:
+        resource = pkg_resources.files("gpustack.third_party.bin.fastfetch") / command
+        with pkg_resources.as_file(resource) as executable_path:
             return str(executable_path)
 
     def _command_version(self):
@@ -274,9 +273,10 @@ class Fastfetch(GPUDetector, SystemInfoDetector):
         return executable_command
 
     def _command_gather_gpu(self):
-        with pkg_resources.path(
-            "gpustack.detectors.fastfetch", "config_gpu.jsonc"
-        ) as config_path:
+        resource = pkg_resources.files("gpustack.detectors.fastfetch").joinpath(
+            "config_gpu.jsonc"
+        )
+        with pkg_resources.as_file(resource) as config_path:
             executable_path = self._command_executable_path()
 
             executable_command = [
@@ -295,9 +295,10 @@ class Fastfetch(GPUDetector, SystemInfoDetector):
             return executable_command
 
     def _command_gather_system(self):
-        with pkg_resources.path(
-            "gpustack.detectors.fastfetch", "config_system_info.jsonc"
-        ) as config_path:
+        resource = pkg_resources.files("gpustack.detectors.fastfetch").joinpath(
+            "config_system_info.jsonc"
+        )
+        with pkg_resources.as_file(resource) as config_path:
             executable_path = self._command_executable_path()
             executable_command = [
                 executable_path,

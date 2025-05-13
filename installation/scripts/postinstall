@@ -1,0 +1,26 @@
+#!/bin/bash
+
+set -e
+
+APP_NAME="GPUStack"
+
+PLIST_PATH="/Library/LaunchDaemons/ai.gpustack.plist"
+INSTALL_PATH="/Applications/${APP_NAME}.app"
+rm -rf "$PLIST_PATH" || true
+echo "Creating symlink for $PLIST_PATH"
+ln -sf "$INSTALL_PATH/Contents/Resources/ai.gpustack.plist" "$PLIST_PATH"
+
+DATA_PATH="/Library/Application Support/GPUStack"
+if [ ! -d "$DATA_PATH" ]; then
+  echo "Creating data directory $DATA_PATH"
+  mkdir -p "$DATA_PATH"
+  chown -R root:wheel "$DATA_PATH"
+  chmod -R 755 "$DATA_PATH"
+fi
+
+CONFIG_PATH="$DATA_PATH/config.yaml"
+if [ ! -e "${CONFIG_PATH}" ]; then
+  echo "debug: false" > "${CONFIG_PATH}"
+fi
+
+launchctl bootstrap system "$PLIST_PATH"
