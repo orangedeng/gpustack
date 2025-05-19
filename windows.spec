@@ -9,10 +9,9 @@ datas = [
     ('./gpustack/ui', './gpustack/ui'), 
     ('./gpustack/third_party', './gpustack/third_party'),
     ('./gpustack/detectors/fastfetch/*.jsonc', './gpustack/detectors/fastfetch/'),
-    ('./installation/ai.gpustack.plist', '.'),
 ]
 binaries = []
-hiddenimports = []
+hiddenimports = ['aiosqlite']
 tmp_ret = collect_all('aiosqlite')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
@@ -48,6 +47,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['installation\\GPUStack.ico'],
 )
 coll = COLLECT(
     exe,

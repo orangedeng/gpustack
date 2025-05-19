@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi" xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+  <Product Id="*" Name="GPUStack" Language="1033" Version="$(var.ProductVersion)" Manufacturer="Seal, Inc." UpgradeCode="36e9d56a-5daa-4543-9e37-d2539e22636c" Codepage="65001">
+    <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="INSTALLFOLDER" Name="GPUStack">
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="GPUStackProgramMenu" Name="GPUStack" />
+      </Directory>
+    </Directory>
+
+    <Feature Id="GPUStackAll" Level="1">
+      <ComponentGroupRef Id="ResourceFiles" />
+      <ComponentGroupRef Id="PyinstallerBuiltFiles" />
+    </Feature>
+
+      <DirectoryRef Id="INSTALLFOLDER">
+        <Component Id="License.rtf" Guid="b713d495-d832-4f76-a7ab-e4b4dbcd517a">
+          <File Source="$(var.InstallationDir)\License.rtf" KeyPath="yes" />
+        </Component>
+        <Component Id="NSSMComponent" Guid="01228aaf-9d48-46ae-a2ec-8220022f9b95">
+          <File Id="NSSMExe" Source="$(var.InstallationDir)\nssm.exe" KeyPath="yes" />
+        </Component>
+      </DirectoryRef>
+
+    <DirectoryRef Id="GPUStackProgramMenu">
+      <Component Id="GPUStackShortcutComponent" Guid="b8e1c7e2-1c2a-4e2a-9e2b-1e2c7e2a1c2b">
+        <Shortcut Id="GPUStackStartMenuShortcut"
+                  Name="GPUStack"
+                  Description="GPUStack Launcher"
+                  Target="[INSTALLFOLDER]gpustack.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveGPUStackProgramMenu" Directory="GPUStackProgramMenu" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\Seal, Inc.\GPUStack" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <ComponentGroup Id="ResourceFiles">
+      <ComponentRef Id="License.rtf" />
+      <ComponentRef Id="NSSMComponent" />
+      <ComponentRef Id="GPUStackShortcutComponent" />
+    </ComponentGroup>
+
+    <Property Id="ARPPRODUCTICON" Value="InstallerIcon" />
+    <Icon Id="InstallerIcon" SourceFile="$(var.InstallationDir)\GPUStack.ico" />
+    <UIRef Id="WixUI_InstallDir" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.InstallationDir)\License.rtf" />
+  </Product>
+</Wix>

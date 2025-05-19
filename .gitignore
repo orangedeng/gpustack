@@ -162,3 +162,8 @@ __pycache__/
 .DS_Store
 
 *.dist-info
+
+# Windows installer and package
+*.wixobj
+/installation/_internal_files.wxs
+/installation/nssm.exe
