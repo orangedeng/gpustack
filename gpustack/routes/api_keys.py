@@ -80,6 +80,7 @@ async def create_api_key(
             access_key=access_key,
             hashed_secret_key=get_secret_hash(secret_key),
             expires_at=expires_at,
+            allowed_model_names=key_in.allowed_model_names,
         )
         api_key = await ApiKey.create(session, api_key)
     except Exception as e:
@@ -93,6 +94,7 @@ async def create_api_key(
         created_at=api_key.created_at,
         updated_at=api_key.updated_at,
         expires_at=api_key.expires_at,
+        allowed_model_names=api_key.allowed_model_names,
     )
 
 
