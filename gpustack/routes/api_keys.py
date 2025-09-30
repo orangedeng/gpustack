@@ -10,7 +10,13 @@ from gpustack.api.exceptions import (
 )
 from gpustack.security import API_KEY_PREFIX, get_secret_hash
 from gpustack.server.deps import CurrentUserDep, ListParamsDep, SessionDep, EngineDep
-from gpustack.schemas.api_keys import ApiKey, ApiKeyCreate, ApiKeyPublic, ApiKeysPublic
+from gpustack.schemas.api_keys import (
+    ApiKey,
+    ApiKeyCreate,
+    ApiKeyPublic,
+    ApiKeysPublic,
+    ApiKeyUpdate,
+)
 from gpustack.schemas.users import User
 from gpustack.server.services import APIKeyService
 
@@ -100,3 +106,19 @@ async def delete_api_key(session: SessionDep, user: CurrentUserDep, id: int):
         await APIKeyService(session).delete(api_key)
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to delete api key: {e}")
+
+
+@router.put("/{id}", response_model=ApiKeyPublic)
+async def update_api_key(
+    session: SessionDep, user: CurrentUserDep, id: int, key_in: ApiKeyUpdate
+):
+    api_key = await ApiKey.one_by_id(session, id)
+    if not api_key or api_key.user_id != user.id:
+        raise NotFoundException(message="Api key not found")
+    try:
+        await api_key.update(
+            session=session, source=key_in.model_dump(exclude_unset=True)
+        )
+    except Exception as e:
+        raise InternalServerErrorException(message=f"Failed to update api key: {e}")
+    return api_key
