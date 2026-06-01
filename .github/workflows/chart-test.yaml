@@ -1,0 +1,123 @@
+# Standalone, fork-friendly test for the Helm chart packaging logic.
+#
+# This mirrors the `chart` job in pack.yaml (version mapping + patch + lint +
+# package) WITHOUT the heavy multi-arch Docker build, DockerHub login, or chart
+# push — so it runs quickly on a personal fork with no secrets configured.
+#
+# Trigger it manually (Actions tab -> "Chart Test" -> "Run workflow") and pass
+# the git tag you want to simulate, e.g. v2.2.0rc1, to verify the PEP 440 ->
+# SemVer chart-version conversion. The packaged .tgz is uploaded as an artifact.
+
+name: Chart Test
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to simulate (e.g. v2.2.0rc1 or v2.2.0)"
+        required: true
+        default: "v2.2.0rc1"
+
+jobs:
+  chart:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Compute chart version metadata
+        id: chart_meta
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          #
+          # Identical mapping to pack.yaml's chart job, but driven by the
+          # workflow_dispatch `tag` input instead of GITHUB_REF so it can be
+          # exercised on any branch without cutting a real tag.
+          #
+          set -euo pipefail
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          REF="refs/tags/${INPUT_TAG}"
+
+          if [[ "${REF}" == refs/tags/v*.*.* ]]; then
+            RAW="${REF#refs/tags/v}"
+            APP_VERSION="${RAW}"
+            IMAGE_TAG="v${RAW}"
+            if [[ "${RAW}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(a|b|rc|alpha|beta)\.?([0-9]+)$ ]]; then
+              VERSION="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+            else
+              VERSION="${RAW}"
+            fi
+          else
+            echo "Input '${INPUT_TAG}' is not a vX.Y.Z[pre] tag" >&2
+            exit 1
+          fi
+
+          echo "version=${VERSION}"           >> "$GITHUB_OUTPUT"
+          echo "app_version=${APP_VERSION}"   >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}"       >> "$GITHUB_OUTPUT"
+
+          echo "::notice title=Chart version mapping::tag=${INPUT_TAG} -> version=${VERSION} appVersion=${APP_VERSION} image.tag=${IMAGE_TAG}"
+
+      - name: Patch Chart.yaml & values.yaml
+        env:
+          VERSION:     ${{ steps.chart_meta.outputs.version }}
+          APP_VERSION: ${{ steps.chart_meta.outputs.app_version }}
+          IMAGE_TAG:   ${{ steps.chart_meta.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          PLUGINS_VERSION=$(yq -p=toml -oy \
+            '.package[] | select(.name == "gpustack-higress-plugins") | .version' \
+            uv.lock)
+          yq --version | grep -oP 'v\K[0-9.]+' | awk -F. '{ exit !($1>4 || ($1==4 && $2>=30)) }'
+          if [[ -z "${PLUGINS_VERSION}" || "${PLUGINS_VERSION}" == "null" ]]; then
+            echo "Failed to resolve gpustack-higress-plugins version from uv.lock" >&2
+            exit 1
+          fi
+          export PLUGINS_VERSION
+          yq -i '.version    = strenv(VERSION)'                       charts/gpustack-chart/Chart.yaml
+          yq -i '.appVersion = strenv(APP_VERSION)'                   charts/gpustack-chart/Chart.yaml
+          yq -i '.image.tag  = strenv(IMAGE_TAG)'                     charts/gpustack-chart/values.yaml
+          yq -i '.higressPlugins.image.tag = strenv(PLUGINS_VERSION)' charts/gpustack-chart/values.yaml
+          echo "--- Chart.yaml ---"
+          cat charts/gpustack-chart/Chart.yaml
+          echo "--- values.yaml image stanza ---"
+          yq '.image' charts/gpustack-chart/values.yaml
+          echo "--- values.yaml higressPlugins.image stanza ---"
+          yq '.higressPlugins.image' charts/gpustack-chart/values.yaml
+
+      - name: Helm lint
+        run: helm lint charts/gpustack-chart
+
+      - name: Helm dependency update
+        run: helm dependency update charts/gpustack-chart
+
+      - name: Helm package
+        run: |
+          mkdir -p dist
+          helm package charts/gpustack-chart -d dist/
+          ls -l dist/
+
+      - name: Upload packaged chart
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpustack-chart-${{ steps.chart_meta.outputs.version }}
+          path: dist/*.tgz
+          if-no-files-found: error
+          retention-days: 7
