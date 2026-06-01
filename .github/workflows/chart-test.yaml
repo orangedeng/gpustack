@@ -5,8 +5,9 @@
 # push — so it runs quickly on a personal fork with no secrets configured.
 #
 # Trigger it manually (Actions tab -> "Chart Test" -> "Run workflow") and pass
-# the git tag you want to simulate, e.g. v2.2.0rc1, to verify the PEP 440 ->
-# SemVer chart-version conversion. The packaged .tgz is uploaded as an artifact.
+# the git tag you want to simulate, e.g. v2.2.0rc1 or v2.2.0rc1-ent, to verify
+# the PEP 440 -> SemVer chart-version conversion. The packaged .tgz is uploaded
+# as an artifact.
 
 name: Chart Test
 
@@ -21,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag to simulate (e.g. v2.2.0rc1 or v2.2.0)"
+        description: "Git tag to simulate (e.g. v2.2.0rc1, v2.2.0rc1-ent or v2.2.0)"
         required: true
         default: "v2.2.0rc1"
 
@@ -59,8 +60,8 @@ jobs:
             RAW="${REF#refs/tags/v}"
             APP_VERSION="${RAW}"
             IMAGE_TAG="v${RAW}"
-            if [[ "${RAW}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(a|b|rc|alpha|beta)\.?([0-9]+)$ ]]; then
-              VERSION="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+            if [[ "${RAW}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(a|b|rc|alpha|beta)\.?([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+              VERSION="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
             else
               VERSION="${RAW}"
             fi
