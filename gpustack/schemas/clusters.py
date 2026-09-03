@@ -250,6 +250,38 @@ class OperatorOptions(BaseModel):
     )
 
 
+# Value paths the server derives from the cluster's registration, and which a
+# caller therefore cannot set: each one decides what the deployment *is* rather
+# than how it is configured. Overriding `worker.serverURL` points the workers at
+# a different server than the one that issued the token; `server.enabled` adds a
+# second control plane to a cluster that registered with one; `image.tag` breaks
+# the pairing between the worker image and the templates that render it, which is
+# how an install ends up with an operator and a worker of different generations.
+SERVER_OWNED_VALUE_PATHS = frozenset(
+    {
+        "appliedRevision",
+        "higress-core.enabled",
+        "image.repository",
+        "image.tag",
+        "imagePullSecret.create",
+        "registrationTokenSecretName",
+        "server.enabled",
+        "worker.enabled",
+        "worker.serverURL",
+    }
+)
+
+
+def _value_path_set(values: Dict[str, Any], path: str) -> bool:
+    """Whether ``path`` ("a.b.c") is present in ``values``."""
+    cursor: Any = values
+    for segment in path.split("."):
+        if not isinstance(cursor, dict) or segment not in cursor:
+            return False
+        cursor = cursor[segment]
+    return True
+
+
 class K8sOptions(BaseModel):
     """
     All Kubernetes-side deployment knobs for a cluster's worker DaemonSets:
@@ -317,6 +349,48 @@ class K8sOptions(BaseModel):
         alias="operator",
         description="Operator-specific deployment options for the cluster.",
     )
+    helm_values: Optional[Dict[str, Any]] = PydanticField(
+        default=None,
+        alias="helmValues",
+        description=(
+            "Values passed to the GPUStack chart the registration manifest "
+            "installs, merged over the ones the server derives from this "
+            "cluster. Keys are the chart's own, verbatim — see its values.yaml "
+            "and, for anything under `gpustack-operator`, the operator chart's.\n\n"
+            "Nothing is mirrored into a GPUStack-shaped schema here on purpose: "
+            "the chart and its sub-charts carry a large surface that moves with "
+            "their releases, and a field-by-field copy would have to be kept in "
+            "lockstep with it forever.\n\n"
+            "A cluster that already runs Kueue, for example, skips installing a "
+            "second one with "
+            '`{"gpustack-operator": {"kueue": {"enabled": false}}}`. Note what '
+            "that means: the operator still requires Kueue and Node Feature "
+            "Discovery to derive the scheduling chain and waits for their CRDs at "
+            "startup, so switching one off that is not actually present leaves "
+            "the operator unable to start. Switching off one this release "
+            "installed removes it — Kueue's CRDs come from its chart, and every "
+            "Workload and ClusterQueue goes with them.\n\n"
+            "Merging is per key and depth-first; a list replaces rather than "
+            "extends. The paths that decide what this deployment *is* are the "
+            f"server's and are refused here: {', '.join(sorted(SERVER_OWNED_VALUE_PATHS))}."
+        ),
+    )
+
+    @field_validator("helm_values")
+    def validate_helm_values(cls, v):
+        if not v:
+            return v
+        refused = sorted(
+            path for path in SERVER_OWNED_VALUE_PATHS if _value_path_set(v, path)
+        )
+        if refused:
+            raise ValueError(
+                f"{', '.join(refused)} cannot be set here: the server derives "
+                "them from this cluster's registration, and overriding them "
+                "would produce a release that does not match the cluster it was "
+                "issued for"
+            )
+        return v
 
 
 def is_gpu_service_k8s_options(k8s_options: Any) -> bool:

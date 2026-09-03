@@ -1,0 +1,159 @@
+{#-
+  The registration manifest for a Kubernetes-provider cluster.
+
+  It carries no workload objects. Everything that runs is rendered by the
+  GPUStack chart, which the Job below installs from this server — so this file
+  only has to deliver what the chart cannot supply itself: the namespaces, the
+  registration token, the pull credentials, the values, and the Job.
+
+  Three objects are deliberately owned by kubectl rather than Helm. The token
+  Secret, because a re-render must not be able to rotate or delete it; the pull
+  Secrets, because the chart can only create one and a cluster may have several;
+  and the values ConfigMap, because the Job that reads it is created from it.
+-#}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ config.namespace }}
+---
+{#- Where the operator places this cluster owner's namespaced resources. #}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ config.cluster_owner_namespace }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ registration_token_secret_name }}
+  namespace: {{ config.namespace }}
+  annotations:
+    {#-
+      Helm prunes what a previous revision rendered and the new one does not, by
+      name — which is exactly this Secret on a cluster whose chart used to create
+      it. Losing it leaves running workers alive (their env is already injected)
+      and every new pod unable to start, since it is mounted with
+      `optional: false`. Helm honours this annotation on the live object, so the
+      prune skips it; on a cluster that never had it, the annotation is inert.
+    #}
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  {%- for k, v in config.env.items() %}
+  {{ k }}: {{ v | b64encode }}
+  {%- endfor %}
+{%- for ips in config.image_pull_secrets %}
+---
+# Image pull secret for {{ ips.registry }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ ips.name }}
+  namespace: {{ config.namespace }}
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: {{ ips.dockerconfigjson_b64 }}
+{%- endfor %}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ bootstrap_name }}
+  namespace: {{ config.namespace }}
+data:
+  values.yaml: |
+{{ chart_values | indent(4, true) }}
+  install.sh: |
+{{ bootstrap_script | indent(4, true) }}---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ bootstrap_name }}
+  namespace: {{ config.namespace }}
+---
+{#
+  cluster-admin, because installing the chart means creating CRDs, ClusterRoles,
+  APIServices and webhook configurations — a bounded role for "may install this
+  chart" would have to enumerate everything the chart and its sub-charts render,
+  and would silently break the next time any of them grows an object kind.
+
+  Scoped to a Job that runs once per configuration change rather than to a
+  long-lived workload.
+#}apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ bootstrap_name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ bootstrap_name }}
+    namespace: {{ config.namespace }}
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+{#
+  The Job's name carries a hash of everything it acts on, and it is the only
+  object here that does. That is what makes re-applying this manifest behave:
+  identical inputs resolve to the same name, so `kubectl apply` leaves the
+  Completed Job alone and the apply is a no-op; changed inputs resolve to a Job
+  that does not exist yet and therefore runs. A fixed name would leave it
+  Completed and the change unapplied until its TTL expired.
+
+  The ConfigMap it reads keeps a fixed name and is updated in place, so a stale
+  Job that starts late installs the current configuration rather than the one it
+  was created for — and no orphan accumulates, which a hashed ConfigMap would do
+  on every change since `kubectl apply` does not prune and only a Job has a TTL.
+
+  The image is the operator's: it already ships helm and kubectl, and this
+  cluster pulls it anyway for the control plane the chart deploys.
+#}apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ job_name }}
+  namespace: {{ config.namespace }}
+spec:
+  backoffLimit: 5
+  # Long enough to outlast an image pull and a chart install, short enough that
+  # a wedged run gives up instead of holding the Job open forever.
+  activeDeadlineSeconds: 1800
+  # Kept for a day after it finishes so its logs remain available: they are the
+  # only record of what the install did, since the server never sees it.
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ bootstrap_name }}
+      {%- if config.image_pull_secrets %}
+      imagePullSecrets:
+      {%- for ips in config.image_pull_secrets %}
+        - name: {{ ips.name }}
+      {%- endfor %}
+      {%- endif %}
+      {%- if config.k8s_options and config.k8s_options.node_selector %}
+      nodeSelector:
+        {{ config.k8s_options.node_selector | to_yaml | indent(8) }}
+      {%- endif %}
+      containers:
+        - name: install
+          image: {{ config.operator_image }}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/bootstrap/install.sh"]
+          env:
+            - name: RELEASE
+              value: {{ release_name }}
+            - name: NAMESPACE
+              value: {{ config.namespace }}
+            - name: CHART_URL
+              value: {{ chart_url | tojson }}
+            - name: VALUES_FILE
+              value: /bootstrap/values.yaml
+            - name: DESIRED_REVISION
+              value: {{ applied_revision }}
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /bootstrap
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: {{ bootstrap_name }}
