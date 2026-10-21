@@ -77,6 +77,7 @@ from gpustack.schemas.models import (
     RoleStatus,
     SourceEnum,
     get_backend,
+    is_decision_model,
     member_worker_ids,
     role_effective_model,
     shared_cache_service_ids_by_role,
@@ -223,6 +224,7 @@ from gpustack.routes.plugins import (
 )
 from gpustack.routes.plugins.decision_service.providers import (
     DECISION_PROVIDER_TYPES,
+    decision_model_referencing_route_ids,
     sync_decision_service_providers,
 )
 from gpustack.routes.plugins.decision_service.plugin import (
@@ -532,6 +534,7 @@ class ModelController:
                 await sync_categories_and_meta(session, model, event)
                 await self._ensure_model_mcp_bridge(session, event.type, model)
                 await self._sync_model_ai_proxy(session, model)
+                await self._sync_decision_catalogue(session, model, event)
         except Exception as e:
             logger.error(f"Failed to reconcile model {model.name}: {e}")
             raise
@@ -550,6 +553,72 @@ class ModelController:
             extensions_api=self._higress_extension_api,
             model_id=model.id,
         )
+
+    def _affects_decision_catalogue(self, model: Model, event: Event) -> bool:
+        """Whether this model event can move the decision-service
+        catalogue: it is a decision deployment now, or it stopped being one
+        (categories change), or it went away entirely. Instance liveness
+        arrives here as model events too (ready-replica sync), so one gate
+        covers both the entry's existence and its cluster target."""
+        if is_decision_model(model):
+            return True
+        changed = event.changed_fields or {}
+        if "categories" not in changed:
+            return False
+        categories_change = changed["categories"]
+        old_categories = (
+            _changed_scalar(categories_change[0])
+            if categories_change and len(categories_change) > 0
+            else None
+        )
+        if isinstance(old_categories, (list, tuple)):
+            return "decision" in old_categories
+        return False
+
+    async def _sync_decision_catalogue(
+        self, session: AsyncSession, model: Model, event: Event
+    ):
+        """Rebuild the decision-service providers catalogue when the model
+        half of it may have moved, then re-reconcile the routes whose
+        stored section pins this model. Mirrors the ModelProvider
+        controller's decision pass on the other half of the catalogue."""
+        if self._disable_gateway:
+            return
+        if not self._affects_decision_catalogue(model, event):
+            return
+        try:
+            await sync_decision_service_providers(
+                cfg=self._config,
+                session=session,
+                extensions_api=self._higress_extension_api,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to ensure decision-service provider config for "
+                f"model {model.name}: {e}"
+            )
+            raise
+        try:
+            async with async_session() as notify_session:
+                policies = await CapabilityPolicy.all_by_fields(
+                    notify_session, fields={"capability": "decision-service"}
+                )
+                route_ids = decision_model_referencing_route_ids(policies, model.id)
+                for route_id in sorted(route_ids):
+                    route = await ModelRoute.one_by_id(notify_session, route_id)
+                    if route is None:
+                        continue
+                    route_copy = ModelRoute.model_validate(route.model_dump())
+                    await event_bus.publish(
+                        route_copy.__class__.__name__.lower(),
+                        Event(type=EventType.UPDATED, data=route_copy),
+                    )
+        except Exception as e:
+            logger.error(
+                "Failed to notify decision-service routes for model %s: %s",
+                model.id,
+                e,
+            )
 
 
 class ModelInstanceController:

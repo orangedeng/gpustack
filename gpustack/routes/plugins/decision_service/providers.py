@@ -32,6 +32,13 @@ from gpustack.schemas.model_provider import (
     ModelProviderTypeEnum,
     TypesafeConfig,
 )
+from gpustack.schemas.models import (
+    Model,
+    ModelInstance,
+    ModelInstanceStateEnum,
+    is_decision_model,
+    servable_instances,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +146,120 @@ def decision_provider_entry(provider: ModelProvider) -> Optional[Dict[str, Any]]
     return entry
 
 
+def decision_model_entry(
+    model: Model, instances: List[ModelInstance]
+) -> Optional[Dict[str, Any]]:
+    """One locally deployed decision Model's catalogue entry.
+
+    Every servable RUNNING instance rides the entry as one cluster in the
+    ``clusters`` list: the plugin (v0.5.0.post2+ / plugin VERSION 0.2.0)
+    picks one uniformly at random per callout, so the decision traffic
+    spreads across the replicas. The legacy singular ``cluster`` (first
+    instance) and the ``endpoint`` (:authority source, still required by
+    the plugin) are rendered alongside so plugin builds that predate the
+    list form resolve the entry too — ``clusters`` takes precedence over
+    ``cluster`` on builds that know it.
+
+    No ``apiTokens``: local instances are not credential-gated (the same
+    posture as inference traffic reaching them directly); an authenticated
+    self-hosted service belongs on a ``gpustack-lb-typesafe`` provider row.
+    """
+    from gpustack.gateway import utils as gateway_utils
+
+    resolved = []
+    for instance in instances:
+        address = instance.worker_advertise_address or instance.worker_ip
+        if not address or instance.port is None:
+            continue
+        registry = gateway_utils.model_instance_registry(instance)
+        if registry is None:
+            continue
+        resolved.append((instance, address, registry))
+    if not resolved:
+        return None
+
+    def _cluster_name(registry) -> str:
+        return f"outbound|{registry.port}||{registry.get_service_name()}"
+
+    first_instance, first_address, first_registry = resolved[0]
+    # The served model name is the natural decision-engine alias for a
+    # local engine (vLLM/SGLang accept any name and ignore the
+    # distinction); a route's decisionModel overrides it.
+    return {
+        "id": gateway_utils.model_ai_proxy_provider_id(model.id),
+        "type": "systemone",
+        "endpoint": f"http://{first_address}:{first_instance.port}",
+        "model": model.name,
+        "clusters": [_cluster_name(registry) for _, _, registry in resolved],
+        "cluster": _cluster_name(first_registry),
+    }
+
+
+def decision_model_entries(
+    models: List[Model], instances: List[ModelInstance]
+) -> List[Dict[str, Any]]:
+    """The locally deployed half of the catalogue: one entry per decision
+    Model that has a RUNNING servable instance, model-id-sorted for a
+    byte-stable CR.
+
+    A model whose instances are all down is absent rather than present with
+    dead clusters: routes selecting it fail open (their rule is stripped)
+    until an instance is back, which the model-event-driven catalogue sync
+    re-renders. Every servable RUNNING instance enters the entry's
+    ``clusters`` list (instance-id order, byte-stable) — the plugin spreads
+    the callouts across them — with the lowest-id instance also serving the
+    legacy singular ``cluster`` and the ``endpoint``.
+    """
+    instances_by_model: Dict[int, List[ModelInstance]] = {}
+    for instance in instances:
+        if instance.model_id is None:
+            continue
+        if instance.state != ModelInstanceStateEnum.RUNNING:
+            continue
+        if getattr(instance, "deleted_at", None) is not None:
+            continue
+        instances_by_model.setdefault(instance.model_id, []).append(instance)
+
+    entries: List[Dict[str, Any]] = []
+    for model in sorted(models, key=lambda m: m.id):
+        if model.deleted_at is not None or not is_decision_model(model):
+            continue
+        running = servable_instances(model, instances_by_model.get(model.id, []))
+        candidates = sorted(
+            running,
+            key=lambda inst: inst.id if inst.id is not None else 0,
+        )
+        if not candidates:
+            continue
+        try:
+            entry = decision_model_entry(model, candidates)
+        except Exception as e:
+            logger.warning(
+                "decision-service catalogue entry for model %s (id %s) "
+                "could not be built; skipping it: %s",
+                model.name,
+                model.id,
+                e,
+            )
+            continue
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def decision_model_referencing_route_ids(
+    policies: List[Any], model_id: int
+) -> "set[int]":
+    """Route ids whose stored decision-service policy pins ``model_id`` —
+    the local-target twin of ``decision_referencing_route_ids``: the routes
+    a model event (instances up/down, category moved) has to re-reconcile."""
+    return {
+        policy.route_id
+        for policy in policies or []
+        if (policy.config or {}).get("modelId") == model_id
+    }
+
+
 def decision_provider_entries(providers: List[ModelProvider]) -> List[Dict[str, Any]]:
     """The full catalogue: one entry per decision-service ModelProvider,
     id-sorted for a byte-stable CR.
@@ -211,16 +332,22 @@ async def sync_decision_service_providers(
     session: AsyncSession,
     extensions_api: Any,
 ) -> None:
-    """Rebuild the CR's providers catalogue from every decision
-    ModelProvider. Runs on ModelProvider events; the route-driven
-    matchRules are preserved untouched."""
+    """Rebuild the CR's providers catalogue from every decision source:
+    the external ``gpustack-lb-typesafe`` ModelProviders and the locally
+    deployed decision Models (one entry per deployment with a running
+    servable instance). Runs on ModelProvider and decision-Model events;
+    the route-driven matchRules are preserved untouched."""
     from gpustack.gateway import utils as gateway_utils
 
     if not decision_module_available(cfg):
         return
     providers = await ModelProvider.all_by_field(session, "deleted_at", None)
+    models = await Model.all_by_field(session, "deleted_at", None)
+    instances = await ModelInstance.all_by_field(session, "deleted_at", None)
     default_config = decision_default_config(cfg)
-    default_config["providers"] = decision_provider_entries(providers)
+    default_config["providers"] = decision_provider_entries(providers) + (
+        decision_model_entries(models, instances)
+    )
     # No activeProviderId here: an id that names no catalogue entry makes
     # the plugin's config parse fail outright, and the routes select their
     # provider through the matchRule's activeProviderId instead. Left

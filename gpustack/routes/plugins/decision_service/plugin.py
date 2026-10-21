@@ -31,6 +31,7 @@ from gpustack.routes.plugins.lb.capability import (
 from gpustack.routes.plugins.decision_service.config import DecisionServiceRouteConfig
 from gpustack.routes.plugins.decision_service.providers import (
     decision_default_config,
+    decision_model_entries,
     decision_provider_entries,
     is_decision_config,
 )
@@ -42,44 +43,66 @@ logger = logging.getLogger(__name__)
 CR_PRIORITY = 328
 
 
-async def _provider_resolves(
+async def _decision_target_resolves(
     session: Optional[AsyncSession],
-    provider_id: Optional[int],
-    decision_model: Optional[str] = None,
+    config: "DecisionServiceRouteConfig",
 ) -> bool:
-    """Whether a section still names a decision service — and a decision
-    model the service still offers.
+    """Whether a section still names a decision service that can render —
+    and, for the external kind, a decision model the service still offers.
 
-    Unresolvable here (deleted provider, one whose type moved off the
-    decision types, or a route whose ``decisionModel`` dropped out
-    of the provider's pulled ``models`` cache) must not render: the rule
-    would point the callout at a target that no longer exists. The cache
-    is only populated when someone pulls ``/v1/models``, so an empty cache
-    proves nothing and resolves. None (no session to query, framework
-    tests) resolves too, the skip ``_validate_provider_id`` takes."""
+    Unresolvable (deleted provider/model, a provider whose type moved off
+    the decision types, a local decision model with no running servable
+    instance — the catalogue entry would be absent — or a route whose
+    ``decisionModel`` dropped out of the provider's pulled ``models``
+    cache) must not render: the rule would point the callout at a target
+    that no longer exists. The provider cache is only populated when
+    someone pulls ``/v1/models``, so an empty cache proves nothing and
+    resolves. None (no session to query, framework tests) resolves too,
+    the skip ``_validate_provider_id`` takes."""
     if session is None:
         return True
-    if provider_id is None:
-        return True
-    provider = await ModelProvider.one_by_id(session, provider_id)
-    if (
-        provider is None
-        or provider.deleted_at is not None
-        or not is_decision_config(provider.config)
-    ):
-        return False
-    alias = decision_model
-    if alias is None:
-        alias = provider.config.model
-    if alias is None:
-        # service default — nothing local to validate against
-        return True
-    models = provider.models or []
-    if not models:
-        # cache never pulled: absence here is not evidence the service
-        # dropped the alias
-        return True
-    return any(model.name == alias for model in models)
+    if config.providerId is not None:
+        provider = await ModelProvider.one_by_id(session, config.providerId)
+        if (
+            provider is None
+            or provider.deleted_at is not None
+            or not is_decision_config(provider.config)
+        ):
+            return False
+        alias = config.decisionModel
+        models = provider.models or []
+        if not models:
+            # cache never pulled: absence here is not evidence the service
+            # dropped the alias
+            return True
+        return any(model.name == alias for model in models)
+    if config.modelId is not None:
+        from gpustack.schemas.models import (
+            Model as ModelRow,
+            ModelInstance,
+            ModelInstanceStateEnum,
+            servable_instances,
+        )
+
+        model = await ModelRow.one_by_id(session, config.modelId)
+        if model is None or model.deleted_at is not None:
+            return False
+        if "decision" not in (model.categories or []):
+            return False
+        # The catalogue entry needs a live instance (its registry is the
+        # callout cluster); no servable RUNNING member means the entry is
+        # absent and the rule must come off until one is back.
+        instances = await ModelInstance.all_by_fields(
+            session,
+            fields={"model_id": model.id, "deleted_at": None},
+        )
+        servable = [
+            instance
+            for instance in servable_instances(model, instances)
+            if instance.state == ModelInstanceStateEnum.RUNNING
+        ]
+        return bool(servable)
+    return True
 
 
 def decision_referencing_route_ids(policies: List[Any], provider_id: int) -> "set[int]":
@@ -181,6 +204,59 @@ async def _validate_provider_id(
     )
 
 
+async def _validate_model_id(
+    session: Optional[AsyncSession],
+    model_id: Optional[int],
+    route_owner_principal_id: Optional[int] = None,
+) -> None:
+    """A modelId that is not a live decision-category Model the route's Org
+    owns would render an activeProviderId the wasm plugin cannot resolve —
+    or one that resolves to another Org's decision service (its instance
+    endpoint rides the shared gateway CR). Rejected at write time, with
+    the same tenant alignment the route-target path enforces.
+
+    Deliberately NOT requiring a running instance: a route may be wired up
+    before the deployment is up, and the render gate strips the rule
+    fail-open until an instance exists. Skipped where there is no session
+    to query (framework tests)."""
+    if model_id is None or session is None:
+        return
+    from gpustack.routes.model_routes import _assert_target_tenant_aligned
+    from gpustack.schemas.models import Model as ModelRow
+
+    model = await ModelRow.one_by_id(session, model_id, for_update=True)
+    if (
+        model is None
+        or model.deleted_at is not None
+        or "decision" not in (model.categories or [])
+    ):
+        raise ValueError(
+            f"modelId {model_id} does not reference a locally deployed "
+            "decision model (decision category)"
+        )
+    _assert_target_tenant_aligned(
+        route_owner_principal_id,
+        getattr(model, "owner_principal_id", None),
+        "Model",
+        model_id,
+    )
+
+
+async def _validate_decision_target(
+    session: Optional[AsyncSession],
+    config: DecisionServiceRouteConfig,
+    route_owner_principal_id: Optional[int] = None,
+) -> None:
+    """Write-time check of whichever target the section pins; exactly one
+    is guaranteed by the config's own validator."""
+    if config.providerId is not None:
+        await _validate_provider_id(
+            session, config.providerId, route_owner_principal_id
+        )
+    else:
+        await _validate_model_id(session, config.modelId, route_owner_principal_id)
+
+
 class DecisionServicePlugin(RoutePlugin):
     # The capability key doubles as the gateway plugin name suffix: the CR
     # is gpustack-lb-decision-service (capability_cr_name).
@@ -194,12 +270,9 @@ class DecisionServicePlugin(RoutePlugin):
             return False
         if not (config.enabled and config.modelSelection is not None):
             return False
-        # A providerId or decisionModel that no longer resolves is inert,
-        # not broken: the feature is off for this route until the reference
-        # is fixed.
-        return await _provider_resolves(
-            session, config.providerId, config.decisionModel
-        )
+        # A providerId/modelId that no longer resolves is inert, not broken:
+        # the feature is off for this route until the reference is fixed.
+        return await _decision_target_resolves(session, config)
 
     async def on_route_write(
         self,
@@ -218,9 +291,9 @@ class DecisionServicePlugin(RoutePlugin):
         if section is None:
             return
         config = DecisionServiceRouteConfig.model_validate(section)
-        await _validate_provider_id(
+        await _validate_decision_target(
             session,
-            config.providerId,
+            config,
             getattr(route, "owner_principal_id", None),
         )
         await store_capability_policy(
@@ -278,12 +351,10 @@ class DecisionServicePlugin(RoutePlugin):
             and config is not None
             and config.enabled
             and config.modelSelection is not None
-            # an unresolvable providerId/decisionModel strips the rule
-            # rather than rendering an activeProviderId or model alias the
-            # plugin cannot match
-            and await _provider_resolves(
-                ctx.session, config.providerId, config.decisionModel
-            )
+            # an unresolvable providerId/modelId/decisionModel strips the
+            # rule rather than rendering an activeProviderId or model alias
+            # the plugin cannot match
+            and await _decision_target_resolves(ctx.session, config)
         )
 
         # A bare context (no collector wired) still reconciles: a local
@@ -299,7 +370,15 @@ class DecisionServicePlugin(RoutePlugin):
             providers = await ModelProvider.all_by_field(
                 ctx.session, "deleted_at", None
             )
-            inert["providers"] = decision_provider_entries(providers)
+            from gpustack.schemas.models import Model, ModelInstance
+
+            models = await Model.all_by_field(ctx.session, "deleted_at", None)
+            instances = await ModelInstance.all_by_field(
+                ctx.session, "deleted_at", None
+            )
+            inert["providers"] = decision_provider_entries(providers) + (
+                decision_model_entries(models, instances)
+            )
         except Exception as e:
             logger.warning(
                 "could not attach the providers catalogue to the "

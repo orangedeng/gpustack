@@ -79,6 +79,13 @@ class CategoryEnum(str, Enum):
     RERANKER = "reranker"
     SPEECH_TO_TEXT = "speech_to_text"
     TEXT_TO_SPEECH = "text_to_speech"
+    # A deployment serving the Jev/System One decision API (``POST
+    # /v1/systemone``) rather than generation semantics. Distinct from the
+    # "decision" category ``determine_model_category`` already puts on decision
+    # providers' model cache: this one marks a servable deployment, and it is
+    # also what routes may filter on and what the decision-service plugin
+    # accepts as a local decision target.
+    DECISION = "decision"
     UNKNOWN = "unknown"
 
 
@@ -1059,6 +1066,30 @@ class ModelSpecBase(SQLModel, ModelSource):
     replicas: int = Field(default=1, ge=0)
     ready_replicas: int = Field(default=0, ge=0)
     categories: List[str] = Field(sa_type=JSON, default=[])
+
+    @field_validator("categories", mode="before")
+    @classmethod
+    def _categories_are_known(cls, v):
+        """Reject category strings outside ``CategoryEnum`` at the write
+        boundary, mirroring the route-side whitelist.
+
+        Decision is the case this guards hardest: its identity IS the
+        string, there is no auto-detection to correct a typo (unlike
+        llm/embedding/reranker, which the scheduler derives from the model
+        artifacts when ``categories`` is empty), so ``"Decision"`` or
+        ``"decisions"`` would silently create a model that is not a
+        decision provider and not filterable as one — failing nowhere,
+        working nowhere. ``None`` passes through untouched, as the
+        route-side validator does.
+        """
+        if v is None:
+            return v
+        known = {e.value for e in CategoryEnum}
+        for category in v:
+            if category not in known:
+                raise ValueError(f"Invalid category: {category}")
+        return v
+
     placement_strategy: PlacementStrategyEnum = PlacementStrategyEnum.SPREAD
     cpu_offloading: Optional[bool] = None
     distributed_inference_across_workers: Optional[bool] = Field(
@@ -2140,6 +2171,16 @@ def is_reranker_model(model: Model):
         model: Model to check.
     """
     return "reranker" in model.categories
+
+
+def is_decision_model(model: Model) -> bool:
+    """
+    Check if the model serves the decision API (System One / Jev contract,
+    ``POST /v1/systemone``).
+    Args:
+        model: Model to check.
+    """
+    return "decision" in model.categories
 
 
 def get_backend(model: Model) -> str:

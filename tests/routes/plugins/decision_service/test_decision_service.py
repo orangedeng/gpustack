@@ -9,9 +9,15 @@ from gpustack.routes.plugins.capability_policy import CapabilityPolicy
 from gpustack.routes.plugins.decision_service.config import DecisionServiceRouteConfig
 from gpustack.routes.plugins.decision_service.plugin import decision_service_plugin
 from gpustack.routes.plugins.decision_service.providers import (
+    decision_model_entries,
     decision_provider_entries,
 )
 from gpustack.routes.plugins.decision_service.spec_diff import decision_static_spec_diff
+from gpustack.schemas.models import (
+    Model,
+    ModelInstance,
+    ModelInstanceStateEnum,
+)
 from gpustack.schemas.model_provider import (
     ModelProvider,
     ModelProviderTypeEnum,
@@ -779,3 +785,167 @@ class TestChangedFieldsShapes:
         )
         asyncio.run(controller._notify_decision_service_routes(event))
         assert queried.get("capability") == "decision-service"
+
+
+class TestLocalDecisionModelConfig:
+    """The modelId half of the section: exactly-one target, its catalogue
+    id, and the route-id lookup a model event uses to find its routes."""
+
+    def test_model_id_replaces_provider_id(self):
+        config = DecisionServiceRouteConfig.model_validate(
+            {
+                "modelId": 12,
+                "decisionModel": "d3-flash",
+                "modelSelection": {"criteria": {"m1": "fast", "m2": "smart"}},
+            }
+        )
+        rule = config.to_gateway_rule()
+        assert rule["activeProviderId"] == "gpustack-model-12"
+
+    def test_both_targets_rejected(self):
+        with pytest.raises(ValidationError):
+            DecisionServiceRouteConfig.model_validate(
+                {
+                    "providerId": 7,
+                    "modelId": 12,
+                    "decisionModel": "jev-latest",
+                }
+            )
+
+    def test_neither_target_rejected(self):
+        with pytest.raises(ValidationError):
+            DecisionServiceRouteConfig.model_validate({"decisionModel": "jev-latest"})
+
+    def test_legacy_provider_only_section_still_valid(self):
+        config = DecisionServiceRouteConfig.model_validate(
+            {"providerId": 7, "decisionModel": "jev-latest"}
+        )
+        assert config.providerId == 7
+        assert config.modelId is None
+        assert config.to_gateway_rule()["activeProviderId"] == "provider-7"
+
+    def test_model_referencing_route_ids_selects_policies_pointing_at_model(self):
+        from gpustack.routes.plugins.decision_service.providers import (
+            decision_model_referencing_route_ids,
+        )
+
+        policies = [
+            CapabilityPolicy(
+                capability="decision-service",
+                route_id=1,
+                config={"modelId": 12, "enabled": True},
+            ),
+            CapabilityPolicy(
+                capability="decision-service",
+                route_id=2,
+                config={"providerId": 8, "enabled": True},
+            ),
+            CapabilityPolicy(
+                capability="decision-service",
+                route_id=3,
+                config={"modelId": 13, "enabled": True},
+            ),
+        ]
+        assert decision_model_referencing_route_ids(policies, 12) == {1}
+        assert decision_model_referencing_route_ids(policies, 13) == {3}
+        assert decision_model_referencing_route_ids(policies, 8) == set()
+        assert decision_model_referencing_route_ids(None, 12) == set()
+
+
+class TestLocalDecisionModelEntries:
+    """The locally deployed half of the CR catalogue: entries are the
+    deployment's running instance, absent without one."""
+
+    def _model(self, model_id=12, categories=("decision",)):
+        return Model(
+            id=model_id,
+            name="d3-flash",
+            categories=list(categories),
+        )
+
+    def _instance(
+        self,
+        instance_id=35,
+        model_id=12,
+        state=ModelInstanceStateEnum.RUNNING,
+        address="192.168.1.20",
+        port=40201,
+    ):
+        return ModelInstance(
+            id=instance_id,
+            model_id=model_id,
+            name=f"model-instance-{instance_id}",
+            worker_ip=address,
+            port=port,
+            state=state,
+        )
+
+    def test_entry_points_at_running_instance_registry(self):
+        # The catalogue entry is the deployment's instances: every servable
+        # RUNNING one contributes a cluster to the list the plugin spreads
+        # callouts across; the singular cluster/endpoint (first instance)
+        # stay for plugin builds predating the list form.
+        entries = decision_model_entries([self._model()], [self._instance()])
+        assert entries == [
+            {
+                "id": "gpustack-model-12",
+                "type": "systemone",
+                "endpoint": "http://192.168.1.20:40201",
+                "model": "d3-flash",
+                "clusters": ["outbound|80||model-12-35.static"],
+                "cluster": "outbound|80||model-12-35.static",
+            }
+        ]
+
+    def test_model_without_running_instance_is_absent(self):
+        # No servable RUNNING member means no catalogue entry, so routes
+        # selecting the model fail open (rule stripped) instead of calling
+        # out to a dead cluster.
+        assert decision_model_entries([self._model()], []) == []
+        assert (
+            decision_model_entries(
+                [self._model()],
+                [self._instance(state=ModelInstanceStateEnum.ERROR)],
+            )
+            == []
+        )
+
+    def test_every_instance_is_a_cluster_in_id_order(self):
+        # All replicas ride one entry; the plugin picks one cluster
+        # uniformly at random per callout, so the decision traffic
+        # spreads across the deployment.
+        entries = decision_model_entries(
+            [self._model()],
+            [
+                self._instance(instance_id=41, port=40202),
+                self._instance(instance_id=35, port=40201),
+            ],
+        )
+        assert entries[0]["clusters"] == [
+            "outbound|80||model-12-35.static",
+            "outbound|80||model-12-41.static",
+        ]
+        # The legacy singular cluster and the endpoint name the first
+        # (lowest-id) instance for plugin builds without the list form.
+        assert entries[0]["cluster"] == "outbound|80||model-12-35.static"
+        assert entries[0]["endpoint"] == "http://192.168.1.20:40201"
+
+    def test_non_decision_model_excluded(self):
+        assert (
+            decision_model_entries(
+                [self._model(categories=("llm",))], [self._instance()]
+            )
+            == []
+        )
+
+    def test_model_and_provider_entries_coexist(self):
+        # Both halves of the catalogue in one render: providers keep their
+        # provider-{id} ids, models the gpustack-model-{id} ones, so a
+        # route's activeProviderId can never cross the two namespaces.
+        entries = decision_provider_entries(
+            [_provider(provider_id=7, endpoint="http://jev.internal:8010")]
+        ) + decision_model_entries([self._model()], [self._instance()])
+        assert [entry["id"] for entry in entries] == [
+            "provider-7",
+            "gpustack-model-12",
+        ]
