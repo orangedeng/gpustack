@@ -1786,6 +1786,105 @@ async def test_delete_target_recounts_route_counters(monkeypatch):
     assert committed == {"targets": 1, "ready_targets": 0}
 
 
+class TestDecisionImageInputMeta:
+    """A route targeting a gpustack-lb-typesafe provider must publish the
+    hosted TypeSafe image spelling (``decision_image_input: "assets"``) in
+    its meta, so Playground clients do not also send a top-level ``images``
+    array the hosted API rejects with api_usage_error."""
+
+    @staticmethod
+    def _provider(decision=True):
+        from gpustack.schemas.model_provider import (
+            ModelProvider,
+            ModelProviderTypeEnum,
+            OpenAIConfig,
+            TypesafeConfig,
+        )
+
+        return ModelProvider(
+            id=2,
+            name="p2",
+            owner_principal_id=None,
+            config=(
+                TypesafeConfig.model_validate(
+                    {"type": ModelProviderTypeEnum.GPUSTACK_LB_TYPESAFE.value}
+                )
+                if decision
+                else OpenAIConfig(type=ModelProviderTypeEnum.OPENAI)
+            ),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "decision,expected",
+        [
+            (True, {"decision_image_input": "assets"}),
+            (False, None),
+        ],
+    )
+    async def test_provider_target_meta(self, monkeypatch, decision, expected):
+        route = SimpleNamespace(id=1, meta=None)
+        target = SimpleNamespace(provider_id=2, model_id=None, deleted_at=None)
+
+        async def fake_targets(session, field, value, **kw):
+            return [target]
+
+        async def fake_provider(session=None, id=None, **kw):
+            return self._provider(decision)
+
+        updates = []
+
+        class FakeService:
+            def __init__(self, session):
+                pass
+
+            async def update(self, model_route, source=None, auto_commit=True):
+                updates.append(source)
+
+        monkeypatch.setattr(model_routes.ModelRouteTarget, "all_by_field", fake_targets)
+        monkeypatch.setattr(model_routes.ModelProvider, "one_by_id", fake_provider)
+        monkeypatch.setattr(model_routes, "ModelRouteService", FakeService)
+
+        await model_routes._refresh_route_decision_image_input(MagicMock(), route)
+
+        if expected is None:
+            # No declaration and nothing stale to clear: no write at all.
+            assert updates == []
+        else:
+            assert updates == [{"meta": expected}]
+
+    @pytest.mark.asyncio
+    async def test_stale_declaration_cleared(self, monkeypatch):
+        route = SimpleNamespace(
+            id=1, meta={"decision_image_input": "assets", "keep": 1}
+        )
+        target = SimpleNamespace(provider_id=2, model_id=None, deleted_at=None)
+
+        async def fake_targets(session, field, value, **kw):
+            return [target]
+
+        async def fake_provider(session=None, id=None, **kw):
+            return self._provider(decision=False)
+
+        updates = []
+
+        class FakeService:
+            def __init__(self, session):
+                pass
+
+            async def update(self, model_route, source=None, auto_commit=True):
+                updates.append(source)
+
+        monkeypatch.setattr(model_routes.ModelRouteTarget, "all_by_field", fake_targets)
+        monkeypatch.setattr(model_routes.ModelProvider, "one_by_id", fake_provider)
+        monkeypatch.setattr(model_routes, "ModelRouteService", FakeService)
+
+        await model_routes._refresh_route_decision_image_input(MagicMock(), route)
+
+        # Only the declaration key goes; unrelated meta survives.
+        assert updates == [{"meta": {"keep": 1}}]
+
+
 class TestValidateTargetsDecisionProvider:
     """A gpustack-lb-typesafe (Jev decision service) provider is a valid
     inference route target: the decision contract is served through the

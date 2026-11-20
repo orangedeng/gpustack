@@ -2721,6 +2721,13 @@ _DECISION_IMAGE_INPUT_BY_BACKEND = {BackendEnum.VLLM.value.lower(): "images"}
 DECISION_IMAGE_INPUT_META_KEY = "decision_image_input"
 
 
+# The provider-side contract, published alongside the backend-keyed ones: a
+# gpustack-lb-typesafe decision provider serves the hosted TypeSafe spelling,
+# where images ride the top-level ``assets`` map ONLY — a top-level
+# ``images`` array alongside ``assets`` is rejected with api_usage_error.
+DECISION_IMAGE_INPUT_ASSETS = "assets"
+
+
 def decision_image_input(backend: Optional[str]) -> Optional[str]:
     """
     The image parameter name the backend's decision API accepts, or None when

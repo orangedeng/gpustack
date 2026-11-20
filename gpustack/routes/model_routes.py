@@ -35,7 +35,11 @@ from gpustack.schemas.links import ModelRoutePrincipalLink
 from gpustack.schemas.principals import platform_principal_id
 from gpustack.schemas.principals import Principal, PrincipalType
 from gpustack.schemas.model_provider import ModelProvider
-from gpustack.schemas.models import Model
+from gpustack.schemas.models import (
+    DECISION_IMAGE_INPUT_ASSETS,
+    DECISION_IMAGE_INPUT_META_KEY,
+    Model,
+)
 from gpustack.server.controllers import notify_model_ai_proxy_change
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
@@ -565,6 +569,55 @@ async def _notify_ai_proxy_models(session: AsyncSession, model_ids: set) -> None
         )
 
 
+async def _refresh_route_decision_image_input(session, route) -> None:
+    """Declare the decision-API image spelling of a route's provider targets
+    in ``route.meta`` (``decision_image_input``).
+
+    Deployment targets get their declaration from the serving backend via
+    ``model.meta`` and the model-controller's meta sync; a provider target
+    has no Model row, so the declaration is derived here instead — a live
+    ``gpustack-lb-typesafe`` target publishes ``"assets"`` (the hosted
+    TypeSafe spelling, where a top-level ``images`` array alongside
+    ``assets`` is rejected) and removing the last such target clears the
+    key, so the Playground never composes image requests against a stale
+    contract.
+
+    Known limit: a route mixing a vLLM decision deployment with a typesafe
+    provider target carries two incompatible spellings; the model sync
+    owns ``meta`` for model-created routes, so its declaration wins there.
+    """
+    from gpustack.routes.plugins.decision_service.providers import (
+        is_decision_config,
+    )
+
+    declared = None
+    targets = await ModelRouteTarget.all_by_field(session, "route_id", route.id)
+    for target in targets:
+        if target.deleted_at is not None or target.provider_id is None:
+            continue
+        provider = await ModelProvider.one_by_id(session=session, id=target.provider_id)
+        if (
+            provider is not None
+            and provider.deleted_at is None
+            and is_decision_config(provider.config)
+        ):
+            declared = DECISION_IMAGE_INPUT_ASSETS
+            break
+
+    meta = dict(route.meta or {})
+    if declared is None:
+        if DECISION_IMAGE_INPUT_META_KEY not in meta:
+            return
+        del meta[DECISION_IMAGE_INPUT_META_KEY]
+    else:
+        if meta.get(DECISION_IMAGE_INPUT_META_KEY) == declared:
+            return
+        meta[DECISION_IMAGE_INPUT_META_KEY] = declared
+    await ModelRouteService(session).update(
+        model_route=route, source={"meta": meta}, auto_commit=True
+    )
+
+
 async def _refresh_route_lb_mode(session: AsyncSession, route_id: int) -> None:
     """Synchronously re-derive ``meta["lb_mode"]`` after a write
     commits. The API write path is the primary refresh point — the
@@ -581,6 +634,12 @@ async def _refresh_route_lb_mode(session: AsyncSession, route_id: int) -> None:
         route = await ModelRoute.one_by_id(session=session, id=route_id)
         if route is not None:
             await lb_plugin.refresh_lb_mode(route, session)
+            # The same post-write refresh point carries the decision-image
+            # contract: the route row a save's response (and the watch event
+            # it emits) publishes must already declare how decision requests
+            # with images are spelled, or Playground clients compose them
+            # against the wrong contract.
+            await _refresh_route_decision_image_input(session, route)
     except Exception:
         # A DB error mid-refresh leaves the session in a failed state;
         # without the rollback every subsequent use of the same session
