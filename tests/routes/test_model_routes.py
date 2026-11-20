@@ -1784,3 +1784,71 @@ async def test_delete_target_recounts_route_counters(monkeypatch):
     )
 
     assert committed == {"targets": 1, "ready_targets": 0}
+
+
+class TestValidateTargetsDecisionProvider:
+    """A gpustack-lb-typesafe (Jev decision service) provider is a valid
+    inference route target: the decision contract is served through the
+    route as a passthrough provider, so only the ordinary checks (model
+    name, tenant alignment) apply."""
+
+    def _provider(self):
+        from gpustack.schemas.model_provider import (
+            ModelProvider,
+            ModelProviderTypeEnum,
+            ProviderModel,
+            TypesafeConfig,
+        )
+
+        return ModelProvider(
+            id=2,
+            name="jev",
+            owner_principal_id=None,
+            config=TypesafeConfig.model_validate(
+                {"type": ModelProviderTypeEnum.GPUSTACK_LB_TYPESAFE.value}
+            ),
+            models=[ProviderModel(name="jev-latest", category="decision")],
+        )
+
+    @pytest.mark.asyncio
+    async def test_decision_provider_target_passes_validation(self, monkeypatch):
+        provider = self._provider()
+
+        async def fake_one_by_id(session=None, id=None, **kw):
+            return provider
+
+        monkeypatch.setattr(model_routes.ModelProvider, "one_by_id", fake_one_by_id)
+
+        fallback = await model_routes.validate_targets(
+            session=MagicMock(),
+            targets=[
+                ModelRouteTargetUpdateItem(
+                    provider_id=2,
+                    overridden_model_name="jev-latest",
+                    weight=1,
+                )
+            ],
+        )
+
+        assert fallback is None
+
+    @pytest.mark.asyncio
+    async def test_decision_provider_target_still_checks_model_name(self, monkeypatch):
+        provider = self._provider()
+
+        async def fake_one_by_id(session=None, id=None, **kw):
+            return provider
+
+        monkeypatch.setattr(model_routes.ModelProvider, "one_by_id", fake_one_by_id)
+
+        with pytest.raises(InvalidException, match="not supported by provider"):
+            await model_routes.validate_targets(
+                session=MagicMock(),
+                targets=[
+                    ModelRouteTargetUpdateItem(
+                        provider_id=2,
+                        overridden_model_name="jev-unknown",
+                        weight=1,
+                    )
+                ],
+            )

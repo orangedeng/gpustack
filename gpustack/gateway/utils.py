@@ -581,16 +581,45 @@ def provider_proxy_plugin_spec(
             is_decision_config,
         )
 
-        if is_decision_config(provider.config):
-            # A Jev decision service feeds the gpustack-lb-decision-service
-            # plugin's providers catalogue, not the inference proxy;
-            # riding the ai-proxy catalogue would deploy an unreachable
-            # provider and a matchRule on a service nobody selects.
-            continue
+        is_decision = is_decision_config(provider.config)
         registry = provider_registry(provider)
         if registry is None:
             continue
         service_name = registry.get_service_name()
+        if is_decision:
+            # A Jev decision service may also serve as an inference route
+            # target. ai-proxy's systemone provider carries the decision
+            # contract natively: the Host header pinned to the provider's
+            # own endpoint (or the hosted TypeSafe default) so a
+            # Cloudflare-fronted upstream never sees a mismatched
+            # authority, the bearer credential from the static apiTokens,
+            # and the both-fields image fallback normalized to the
+            # assets-only spelling the hosted schema accepts. protocol
+            # "original" keeps the paths exactly as the client sent them.
+            dumped = ai_proxy_types.AIProxyDefaultConfig(
+                id=provider_registry_name(provider.id),
+                type=ModelProviderTypeEnum.OPENAI,
+                apiTokens=provider.api_tokens or None,
+                protocol="original",
+                failover=ai_proxy_types.FailoverConfig(enabled=False),
+                retryOnFailure=ai_proxy_types.EnableState(enabled=False),
+            ).model_dump(exclude_none=True, exclude_unset=True)
+            # The ModelProviderTypeEnum has no plugin-side systemone value;
+            # the entry ships the plugin's own provider type name.
+            dumped["type"] = "systemone"
+            if provider.config.endpoint:
+                dumped["endpoint"] = provider.config.endpoint
+            if provider.config.model:
+                dumped["model"] = provider.config.model
+            provider_list.append(dumped)
+            match_rules.append(
+                WasmPluginMatchRule(
+                    config={"activeProviderId": provider_registry_name(provider.id)},
+                    configDisable=False,
+                    service=[service_name],
+                )
+            )
+            continue
         default_config_data = {
             "id": provider_registry_name(provider.id),
             "apiTokens": provider.api_tokens,

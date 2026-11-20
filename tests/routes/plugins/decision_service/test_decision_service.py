@@ -1013,8 +1013,8 @@ class TestRenderAllEntries:
         assert registries == {}
 
 
-class TestAiproxyExclusion:
-    def test_systemone_providers_never_ride_the_aiproxy_catalogue(self):
+class TestAiproxyCatalogue:
+    def test_systemone_providers_ride_the_aiproxy_catalogue_as_passthrough(self):
         from gpustack.gateway.utils import provider_proxy_plugin_spec
 
         providers, match_rules = provider_proxy_plugin_spec(
@@ -1025,8 +1025,18 @@ class TestAiproxyExclusion:
             ),
             _provider(provider_id=3, api_tokens=["k"]),
         )
-        assert providers == []
-        assert match_rules == []
+
+        # A decision provider can be an inference route target: its entry
+        # uses ai-proxy's native systemone provider — Host pinned to the
+        # endpoint, original protocol passthrough, and the both-fields
+        # image fallback normalized to assets-only.
+        assert [p["id"] for p in providers] == ["provider-2", "provider-3"]
+        assert all(p["type"] == "systemone" for p in providers)
+        assert all(p["protocol"] == "original" for p in providers)
+        assert all(p["apiTokens"] == ["k"] for p in providers)
+        assert providers[0]["endpoint"] == "http://jev.tenant-a.internal:8010"
+        assert "endpoint" not in providers[1]
+        assert len(match_rules) == 2
 
 
 class TestReviewHardening:

@@ -1398,18 +1398,10 @@ async def validate_targets(
                 raise NotFoundException(
                     f"ModelProvider with id '{target.provider_id}' not found."
                 )
-            from gpustack.routes.plugins.decision_service.providers import (
-                is_decision_config,
-            )
-
-            if is_decision_config(provider.config):
-                # A decision service feeds the route-selection plugin, not
-                # inference; UI filtering alone is not enforcement.
-                raise InvalidException(
-                    f"ModelProvider {target.provider_id} is a decision "
-                    "service (gpustack-lb-typesafe) and cannot serve as an "
-                    "inference target."
-                )
+            # A gpustack-lb-typesafe (Jev decision service) provider may be
+            # a route target too: the decision contract is served through
+            # the route as a passthrough provider, so the target validates
+            # like any other provider target.
             validate_provider_model_name(provider, target.overridden_model_name)
             _assert_target_tenant_aligned(
                 route_owner_principal_id,
